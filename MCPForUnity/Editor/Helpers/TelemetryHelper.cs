@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Services.Transport.Transports;
 using UnityEngine;
 
 namespace MCPForUnity.Editor.Helpers
@@ -11,8 +13,8 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     public static class TelemetryHelper
     {
-        private const string TELEMETRY_DISABLED_KEY = "MCPForUnity.TelemetryDisabled";
-        private const string CUSTOMER_UUID_KEY = "MCPForUnity.CustomerUUID";
+        private const string TELEMETRY_DISABLED_KEY = EditorPrefKeys.TelemetryDisabled;
+        private const string CUSTOMER_UUID_KEY = EditorPrefKeys.CustomerUuid;
         private static Action<Dictionary<string, object>> s_sender;
 
         /// <summary>
@@ -81,8 +83,8 @@ namespace MCPForUnity.Editor.Helpers
         }
 
         /// <summary>
-        /// Send telemetry data to Python server for processing
-        /// This is a lightweight bridge - the actual telemetry logic is in Python
+        /// Send telemetry data to MCP server for processing
+        /// This is a lightweight bridge - the actual telemetry logic is in the MCP server
         /// </summary>
         public static void RecordEvent(string eventType, Dictionary<string, object> data = null)
         {
@@ -106,16 +108,16 @@ namespace MCPForUnity.Editor.Helpers
                     telemetryData["data"] = data;
                 }
 
-                // Send to Python server via existing bridge communication
-                // The Python server will handle actual telemetry transmission
-                SendTelemetryToPythonServer(telemetryData);
+                // Send to MCP server via existing bridge communication
+                // The MCP server will handle actual telemetry transmission
+                SendTelemetryToMcpServer(telemetryData);
             }
             catch (Exception e)
             {
                 // Never let telemetry errors interfere with functionality
                 if (IsDebugEnabled())
                 {
-                    Debug.LogWarning($"Telemetry error (non-blocking): {e.Message}");
+                    McpLog.Warn($"Telemetry error (non-blocking): {e.Message}");
                 }
             }
         }
@@ -140,8 +142,8 @@ namespace MCPForUnity.Editor.Helpers
         {
             RecordEvent("bridge_startup", new Dictionary<string, object>
             {
-                ["bridge_version"] = "3.0.2",
-                ["auto_connect"] = MCPForUnityBridge.IsAutoConnectMode()
+                ["bridge_version"] = AssetPathUtility.GetPackageVersion(),
+                ["auto_connect"] = StdioBridgeHost.IsAutoConnectMode()
             });
         }
 
@@ -183,7 +185,7 @@ namespace MCPForUnity.Editor.Helpers
             RecordEvent("tool_execution_unity", data);
         }
 
-        private static void SendTelemetryToPythonServer(Dictionary<string, object> telemetryData)
+        private static void SendTelemetryToMcpServer(Dictionary<string, object> telemetryData)
         {
             var sender = Volatile.Read(ref s_sender);
             if (sender != null)
@@ -197,7 +199,7 @@ namespace MCPForUnity.Editor.Helpers
                 {
                     if (IsDebugEnabled())
                     {
-                        Debug.LogWarning($"Telemetry sender error (non-blocking): {e.Message}");
+                        McpLog.Warn($"Telemetry sender error (non-blocking): {e.Message}");
                     }
                 }
             }
@@ -205,7 +207,7 @@ namespace MCPForUnity.Editor.Helpers
             // Fallback: log when debug is enabled
             if (IsDebugEnabled())
             {
-                Debug.Log($"<b><color=#2EA3FF>MCP-TELEMETRY</color></b>: {telemetryData["event_type"]}");
+                McpLog.Info($"Telemetry: {telemetryData["event_type"]}");
             }
         }
 
@@ -213,7 +215,7 @@ namespace MCPForUnity.Editor.Helpers
         {
             try
             {
-                return UnityEditor.EditorPrefs.GetBool("MCPForUnity.DebugLogs", false);
+                return UnityEditor.EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
             }
             catch
             {

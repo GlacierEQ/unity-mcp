@@ -2,13 +2,16 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
+using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Dependencies;
+using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Models;
+using MCPForUnity.Editor.Services;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
-using MCPForUnity.Editor.Dependencies;
-using MCPForUnity.Editor.Helpers;
-using MCPForUnity.Editor.Models;
 
 namespace MCPForUnity.Editor.Helpers
 {
@@ -18,13 +21,13 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     public static class McpConfigurationHelper
     {
-        private const string LOCK_CONFIG_KEY = "MCPForUnity.LockCursorConfig";
+        private const string LOCK_CONFIG_KEY = EditorPrefKeys.LockCursorConfig;
 
         /// <summary>
         /// Writes MCP configuration to the specified path using sophisticated logic
         /// that preserves existing configuration and only writes when necessary
         /// </summary>
-        public static string WriteMcpConfiguration(string pythonDir, string configPath, McpClient mcpClient = null)
+        public static string WriteMcpConfiguration(string configPath, McpClient mcpClient = null)
         {
             // 0) Respect explicit lock (hidden pref or UI toggle)
             try
@@ -46,7 +49,7 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning($"Error reading existing config: {e.Message}.");
+                    McpLog.Warn($"Error reading existing config: {e.Message}.");
                 }
             }
 
@@ -68,7 +71,7 @@ namespace MCPForUnity.Editor.Helpers
                 // If user has partial/invalid JSON (e.g., mid-edit), start from a fresh object
                 if (!string.IsNullOrWhiteSpace(existingJson))
                 {
-                    Debug.LogWarning("UnityMCP: Configuration file could not be parsed; rewriting server block.");
+                    McpLog.Warn("UnityMCP: Configuration file could not be parsed; rewriting server block.");
                 }
                 existingConfig = new JObject();
             }
@@ -76,7 +79,7 @@ namespace MCPForUnity.Editor.Helpers
             // Determine existing entry references (command/args)
             string existingCommand = null;
             string[] existingArgs = null;
-            bool isVSCode = (mcpClient?.mcpType == McpTypes.VSCode);
+            bool isVSCode = (mcpClient?.IsVsCodeLayout == true);
             try
             {
                 if (isVSCode)
@@ -93,50 +96,22 @@ namespace MCPForUnity.Editor.Helpers
             catch { }
 
             // 1) Start from existing, only fill gaps (prefer trusted resolver)
-            string uvPath = ServerInstaller.FindUvPath();
-            // Optionally trust existingCommand if it looks like uv/uv.exe
-            try
-            {
-                var name = Path.GetFileName((existingCommand ?? string.Empty).Trim()).ToLowerInvariant();
-                if ((name == "uv" || name == "uv.exe") && IsValidUvBinary(existingCommand))
-                {
-                    uvPath = existingCommand;
-                }
-            }
-            catch { }
-            if (uvPath == null) return "UV package manager not found. Please install UV first.";
-            string serverSrc = McpConfigFileHelper.ResolveServerDirectory(pythonDir, existingArgs);
+            string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
+            if (uvxPath == null) return "uv package manager not found. Please install uv first.";
 
-            // 2) Canonical args order
-            var newArgs = new[] { "run", "--directory", serverSrc, "server.py" };
-
-            // 3) Only write if changed
-            bool changed = !string.Equals(existingCommand, uvPath, StringComparison.Ordinal)
-                || !ArgsEqual(existingArgs, newArgs);
-            if (!changed)
-            {
-                return "Configured successfully"; // nothing to do
-            }
-
-            // 4) Ensure containers exist and write back minimal changes
+            // Ensure containers exist and write back configuration
             JObject existingRoot;
             if (existingConfig is JObject eo)
                 existingRoot = eo;
             else
                 existingRoot = JObject.FromObject(existingConfig);
 
-            existingRoot = ConfigJsonBuilder.ApplyUnityServerToExistingConfig(existingRoot, uvPath, serverSrc, mcpClient);
+            existingRoot = ConfigJsonBuilder.ApplyUnityServerToExistingConfig(existingRoot, uvxPath, mcpClient);
 
             string mergedJson = JsonConvert.SerializeObject(existingRoot, jsonSettings);
 
-            McpConfigFileHelper.WriteAtomicFile(configPath, mergedJson);
-
-            try
-            {
-                if (File.Exists(uvPath)) EditorPrefs.SetString("MCPForUnity.UvPath", uvPath);
-                EditorPrefs.SetString("MCPForUnity.ServerSrc", serverSrc);
-            }
-            catch { }
+            EnsureConfigDirectoryExists(configPath);
+            WriteAtomicFile(configPath, mergedJson);
 
             return "Configured successfully";
         }
@@ -144,7 +119,7 @@ namespace MCPForUnity.Editor.Helpers
         /// <summary>
         /// Configures a Codex client with sophisticated TOML handling
         /// </summary>
-        public static string ConfigureCodexClient(string pythonDir, string configPath, McpClient mcpClient)
+        public static string ConfigureCodexClient(string configPath, McpClient mcpClient)
         {
             try
             {
@@ -162,7 +137,7 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning($"UnityMCP: Failed to read Codex config '{configPath}': {e.Message}");
+                    McpLog.Warn($"UnityMCP: Failed to read Codex config '{configPath}': {e.Message}");
                     existingToml = string.Empty;
                 }
             }
@@ -174,91 +149,18 @@ namespace MCPForUnity.Editor.Helpers
                 CodexConfigHelper.TryParseCodexServer(existingToml, out existingCommand, out existingArgs);
             }
 
-            string uvPath = ServerInstaller.FindUvPath();
-            try
+            string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
+            if (uvxPath == null)
             {
-                var name = Path.GetFileName((existingCommand ?? string.Empty).Trim()).ToLowerInvariant();
-                if ((name == "uv" || name == "uv.exe") && IsValidUvBinary(existingCommand))
-                {
-                    uvPath = existingCommand;
-                }
-            }
-            catch { }
-
-            if (uvPath == null)
-            {
-                return "UV package manager not found. Please install UV first.";
+                return "uv package manager not found. Please install uv first.";
             }
 
-            string serverSrc = McpConfigFileHelper.ResolveServerDirectory(pythonDir, existingArgs);
-            var newArgs = new[] { "run", "--directory", serverSrc, "server.py" };
+            string updatedToml = CodexConfigHelper.UpsertCodexServerBlock(existingToml, uvxPath);
 
-            bool changed = true;
-            if (!string.IsNullOrEmpty(existingCommand) && existingArgs != null)
-            {
-                changed = !string.Equals(existingCommand, uvPath, StringComparison.Ordinal)
-                    || !ArgsEqual(existingArgs, newArgs);
-            }
-
-            if (!changed)
-            {
-                return "Configured successfully";
-            }
-
-            string codexBlock = CodexConfigHelper.BuildCodexServerBlock(uvPath, serverSrc);
-            string updatedToml = CodexConfigHelper.UpsertCodexServerBlock(existingToml, codexBlock);
-
-            McpConfigFileHelper.WriteAtomicFile(configPath, updatedToml);
-
-            try
-            {
-                if (File.Exists(uvPath)) EditorPrefs.SetString("MCPForUnity.UvPath", uvPath);
-                EditorPrefs.SetString("MCPForUnity.ServerSrc", serverSrc);
-            }
-            catch { }
+            EnsureConfigDirectoryExists(configPath);
+            WriteAtomicFile(configPath, updatedToml);
 
             return "Configured successfully";
-        }
-
-        /// <summary>
-        /// Validates UV binary by running --version command
-        /// </summary>
-        private static bool IsValidUvBinary(string path)
-        {
-            try
-            {
-                if (!File.Exists(path)) return false;
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = path,
-                    Arguments = "--version",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using var p = System.Diagnostics.Process.Start(psi);
-                if (p == null) return false;
-                if (!p.WaitForExit(3000)) { try { p.Kill(); } catch { } return false; }
-                if (p.ExitCode != 0) return false;
-                string output = p.StandardOutput.ReadToEnd().Trim();
-                return output.StartsWith("uv ");
-            }
-            catch { return false; }
-        }
-
-        /// <summary>
-        /// Compares two string arrays for equality
-        /// </summary>
-        private static bool ArgsEqual(string[] a, string[] b)
-        {
-            if (a == null || b == null) return a == b;
-            if (a.Length != b.Length) return false;
-            for (int i = 0; i < a.Length; i++)
-            {
-                if (!string.Equals(a[i], b[i], StringComparison.Ordinal)) return false;
-            }
-            return true;
         }
 
         /// <summary>
@@ -292,6 +194,90 @@ namespace MCPForUnity.Editor.Helpers
         public static void EnsureConfigDirectoryExists(string configPath)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(configPath));
+        }
+
+        public static string ExtractUvxUrl(string[] args)
+        {
+            if (args == null) return null;
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (string.Equals(args[i], "--from", StringComparison.OrdinalIgnoreCase))
+                {
+                    return args[i + 1];
+                }
+            }
+            return null;
+        }
+
+        public static bool PathsEqual(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try
+            {
+                string na = Path.GetFullPath(a.Trim());
+                string nb = Path.GetFullPath(b.Trim());
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    return string.Equals(na, nb, StringComparison.OrdinalIgnoreCase);
+                }
+                return string.Equals(na, nb, StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void WriteAtomicFile(string path, string contents)
+        {
+            string tmp = path + ".tmp";
+            string backup = path + ".backup";
+            bool writeDone = false;
+            try
+            {
+                File.WriteAllText(tmp, contents, new UTF8Encoding(false));
+                try
+                {
+                    File.Replace(tmp, path, backup);
+                    writeDone = true;
+                }
+                catch (FileNotFoundException)
+                {
+                    File.Move(tmp, path);
+                    writeDone = true;
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    if (File.Exists(path))
+                    {
+                        try
+                        {
+                            if (File.Exists(backup)) File.Delete(backup);
+                        }
+                        catch { }
+                        File.Move(path, backup);
+                    }
+                    File.Move(tmp, path);
+                    writeDone = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    if (!writeDone && File.Exists(backup))
+                    {
+                        try { File.Copy(backup, path, true); } catch { }
+                    }
+                }
+                catch { }
+                throw new Exception($"Failed to write config file '{path}': {ex.Message}", ex);
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                try { if (writeDone && File.Exists(backup)) File.Delete(backup); } catch { }
+            }
         }
     }
 }

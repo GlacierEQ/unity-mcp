@@ -2,10 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
+using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Services;
 using MCPForUnity.External.Tommy;
-using Newtonsoft.Json;
+using UnityEditor;
+using UnityEngine;
 
 namespace MCPForUnity.Editor.Helpers
 {
@@ -16,132 +17,232 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     public static class CodexConfigHelper
     {
-        public static bool IsCodexConfigured(string pythonDir)
+        private static void AddUvxModeFlags(TomlArray args)
         {
-            try
-            {
-                string basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                if (string.IsNullOrEmpty(basePath)) return false;
-
-                string configPath = Path.Combine(basePath, ".codex", "config.toml");
-                if (!File.Exists(configPath)) return false;
-
-                string toml = File.ReadAllText(configPath);
-                if (!TryParseCodexServer(toml, out _, out var args)) return false;
-
-                string dir = McpConfigFileHelper.ExtractDirectoryArg(args);
-                if (string.IsNullOrEmpty(dir)) return false;
-
-                return McpConfigFileHelper.PathsEqual(dir, pythonDir);
-            }
-            catch
-            {
-                return false;
-            }
+            if (args == null) return;
+            foreach (var flag in AssetPathUtility.GetUvxDevFlagsList())
+                args.Add(new TomlString { Value = flag });
         }
 
-        public static string BuildCodexServerBlock(string uvPath, string serverSrc)
+        public static string BuildCodexServerBlock(string uvPath)
         {
-            string argsArray = FormatTomlStringArray(new[] { "run", "--directory", serverSrc, "server.py" });
-            return $"[mcp_servers.unityMCP]{Environment.NewLine}" +
-                   $"command = \"{EscapeTomlString(uvPath)}\"{Environment.NewLine}" +
-                   $"args = {argsArray}";
+            var table = new TomlTable();
+            var mcpServers = new TomlTable();
+            var unityMCP = new TomlTable();
+
+            // Check transport preference
+            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+
+            if (useHttpTransport)
+            {
+                // HTTP mode: Use url field
+                string httpUrl = HttpEndpointUtility.GetMcpRpcUrl();
+                unityMCP["url"] = new TomlString { Value = httpUrl };
+
+                // Enable Codex's Rust MCP client for HTTP/SSE transport
+                EnsureRmcpClientFeature(table);
+            }
+            else
+            {
+                // Stdio mode: Use command and args
+                var (uvxPath, _, packageName) = AssetPathUtility.GetUvxCommandParts();
+
+                unityMCP["command"] = uvxPath;
+
+                var args = new TomlArray();
+                AddUvxModeFlags(args);
+                // Use centralized helper for beta server / prerelease args
+                foreach (var arg in AssetPathUtility.GetBetaServerFromArgsList())
+                {
+                    args.Add(new TomlString { Value = arg });
+                }
+                args.Add(new TomlString { Value = packageName });
+                args.Add(new TomlString { Value = "--transport" });
+                args.Add(new TomlString { Value = "stdio" });
+
+                unityMCP["args"] = args;
+
+                // Add Windows-specific environment configuration for stdio mode
+                var platformService = MCPServiceLocator.Platform;
+                if (platformService.IsWindows())
+                {
+                    var envTable = new TomlTable { IsInline = true };
+                    envTable["SystemRoot"] = new TomlString { Value = platformService.GetSystemRoot() };
+                    unityMCP["env"] = envTable;
+                }
+
+                // Allow extra time for uvx to download packages on first run
+                unityMCP["startup_timeout_sec"] = new TomlInteger { Value = 60 };
+            }
+
+            mcpServers["unityMCP"] = unityMCP;
+            table["mcp_servers"] = mcpServers;
+
+            using var writer = new StringWriter();
+            table.WriteTo(writer);
+            return writer.ToString();
         }
 
-        public static string UpsertCodexServerBlock(string existingToml, string newBlock)
+        public static string UpsertCodexServerBlock(string existingToml, string uvPath)
         {
-            if (string.IsNullOrWhiteSpace(existingToml))
+            // Parse existing TOML or create new root table
+            var root = TryParseToml(existingToml) ?? new TomlTable();
+
+            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+
+            // Ensure mcp_servers table exists
+            if (!root.TryGetNode("mcp_servers", out var mcpServersNode) || !(mcpServersNode is TomlTable))
             {
-                return newBlock.TrimEnd() + Environment.NewLine;
+                root["mcp_servers"] = new TomlTable();
+            }
+            var mcpServers = root["mcp_servers"] as TomlTable;
+
+            // Create or update unityMCP table
+            mcpServers["unityMCP"] = CreateUnityMcpTable(uvPath);
+
+            if (useHttpTransport)
+            {
+                EnsureRmcpClientFeature(root);
             }
 
-            StringBuilder sb = new StringBuilder();
-            using StringReader reader = new StringReader(existingToml);
-            string line;
-            bool inTarget = false;
-            bool replaced = false;
-            while ((line = reader.ReadLine()) != null)
-            {
-                string trimmed = line.Trim();
-                bool isSection = trimmed.StartsWith("[") && trimmed.EndsWith("]") && !trimmed.StartsWith("[[");
-                if (isSection)
-                {
-                    bool isTarget = string.Equals(trimmed, "[mcp_servers.unityMCP]", StringComparison.OrdinalIgnoreCase);
-                    if (isTarget)
-                    {
-                        if (!replaced)
-                        {
-                            if (sb.Length > 0 && sb[^1] != '\n') sb.AppendLine();
-                            sb.AppendLine(newBlock.TrimEnd());
-                            replaced = true;
-                        }
-                        inTarget = true;
-                        continue;
-                    }
-
-                    if (inTarget)
-                    {
-                        inTarget = false;
-                    }
-                }
-
-                if (inTarget)
-                {
-                    continue;
-                }
-
-                sb.AppendLine(line);
-            }
-
-            if (!replaced)
-            {
-                if (sb.Length > 0 && sb[^1] != '\n') sb.AppendLine();
-                sb.AppendLine(newBlock.TrimEnd());
-            }
-
-            return sb.ToString().TrimEnd() + Environment.NewLine;
+            // Serialize back to TOML
+            using var writer = new StringWriter();
+            root.WriteTo(writer);
+            return writer.ToString();
         }
 
         public static bool TryParseCodexServer(string toml, out string command, out string[] args)
         {
+            return TryParseCodexServer(toml, out command, out args, out _);
+        }
+
+        public static bool TryParseCodexServer(string toml, out string command, out string[] args, out string url)
+        {
             command = null;
             args = null;
-            if (string.IsNullOrWhiteSpace(toml)) return false;
+            url = null;
+
+            var root = TryParseToml(toml);
+            if (root == null) return false;
+
+            if (!TryGetTable(root, "mcp_servers", out var servers)
+                && !TryGetTable(root, "mcpServers", out servers))
+            {
+                return false;
+            }
+
+            if (!TryGetTable(servers, "unityMCP", out var unity))
+            {
+                return false;
+            }
+
+            // Check for HTTP mode (url field)
+            url = GetTomlString(unity, "url");
+            if (!string.IsNullOrEmpty(url))
+            {
+                // HTTP mode detected - return true with url
+                return true;
+            }
+
+            // Check for stdio mode (command + args)
+            command = GetTomlString(unity, "command");
+            args = GetTomlStringArray(unity, "args");
+
+            return !string.IsNullOrEmpty(command) && args != null;
+        }
+
+        /// <summary>
+        /// Safely parses TOML string, returning null on failure
+        /// </summary>
+        private static TomlTable TryParseToml(string toml)
+        {
+            if (string.IsNullOrWhiteSpace(toml)) return null;
 
             try
             {
                 using var reader = new StringReader(toml);
-                TomlTable root = TOML.Parse(reader);
-                if (root == null) return false;
-
-                if (!TryGetTable(root, "mcp_servers", out var servers)
-                    && !TryGetTable(root, "mcpServers", out servers))
-                {
-                    return false;
-                }
-
-                if (!TryGetTable(servers, "unityMCP", out var unity))
-                {
-                    return false;
-                }
-
-                command = GetTomlString(unity, "command");
-                args = GetTomlStringArray(unity, "args");
-
-                return !string.IsNullOrEmpty(command) && args != null;
+                return TOML.Parse(reader);
             }
             catch (TomlParseException)
             {
-                return false;
+                return null;
             }
             catch (TomlSyntaxException)
             {
-                return false;
+                return null;
             }
             catch (FormatException)
             {
-                return false;
+                return null;
             }
+        }
+
+        /// <summary>
+        /// Creates a TomlTable for the unityMCP server configuration
+        /// </summary>
+        /// <param name="uvPath">Path to uv executable (used as fallback if uvx is not available)</param>
+        private static TomlTable CreateUnityMcpTable(string uvPath)
+        {
+            var unityMCP = new TomlTable();
+
+            // Check transport preference
+            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+
+            if (useHttpTransport)
+            {
+                // HTTP mode: Use url field
+                string httpUrl = HttpEndpointUtility.GetMcpRpcUrl();
+                unityMCP["url"] = new TomlString { Value = httpUrl };
+            }
+            else
+            {
+                // Stdio mode: Use command and args
+                var (uvxPath, _, packageName) = AssetPathUtility.GetUvxCommandParts();
+
+                unityMCP["command"] = new TomlString { Value = uvxPath };
+
+                var argsArray = new TomlArray();
+                AddUvxModeFlags(argsArray);
+                // Use centralized helper for beta server / prerelease args
+                foreach (var arg in AssetPathUtility.GetBetaServerFromArgsList())
+                {
+                    argsArray.Add(new TomlString { Value = arg });
+                }
+                argsArray.Add(new TomlString { Value = packageName });
+                argsArray.Add(new TomlString { Value = "--transport" });
+                argsArray.Add(new TomlString { Value = "stdio" });
+                unityMCP["args"] = argsArray;
+
+                // Add Windows-specific environment configuration for stdio mode
+                var platformService = MCPServiceLocator.Platform;
+                if (platformService.IsWindows())
+                {
+                    var envTable = new TomlTable { IsInline = true };
+                    envTable["SystemRoot"] = new TomlString { Value = platformService.GetSystemRoot() };
+                    unityMCP["env"] = envTable;
+                }
+
+                // Allow extra time for uvx to download packages on first run
+                unityMCP["startup_timeout_sec"] = new TomlInteger { Value = 60 };
+            }
+
+            return unityMCP;
+        }
+
+        /// <summary>
+        /// Ensures the features table contains the rmcp_client flag for HTTP/SSE transport.
+        /// </summary>
+        private static void EnsureRmcpClientFeature(TomlTable root)
+        {
+            if (root == null) return;
+
+            if (!root.TryGetNode("features", out var featuresNode) || featuresNode is not TomlTable features)
+            {
+                features = new TomlTable();
+                root["features"] = features;
+            }
+
+            features["rmcp_client"] = new TomlBoolean { Value = true };
         }
 
         private static bool TryGetTable(TomlTable parent, string key, out TomlTable table)
@@ -211,33 +312,5 @@ namespace MCPForUnity.Editor.Helpers
 
             return null;
         }
-
-        private static string FormatTomlStringArray(IEnumerable<string> values)
-        {
-            if (values == null) return "[]";
-            StringBuilder sb = new StringBuilder();
-            sb.Append('[');
-            bool first = true;
-            foreach (string value in values)
-            {
-                if (!first)
-                {
-                    sb.Append(", ");
-                }
-                sb.Append('"').Append(EscapeTomlString(value ?? string.Empty)).Append('"');
-                first = false;
-            }
-            sb.Append(']');
-            return sb.ToString();
-        }
-
-        private static string EscapeTomlString(string value)
-        {
-            if (string.IsNullOrEmpty(value)) return string.Empty;
-            return value
-                .Replace("\\", "\\\\")
-                .Replace("\"", "\\\"");
-        }
-
     }
 }
